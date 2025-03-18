@@ -1,12 +1,10 @@
-from robot_config import robots
-import sys
 import taichi as ti
 import math
 import numpy as np
 import os
 
 real = ti.f32
-ti.init(default_fp=real)
+ti.init(default_fp=real, arch=ti.cpu)
 
 max_steps = 4096
 vis_interval = 256
@@ -62,7 +60,6 @@ spring_anchor_b = ti.field(ti.i32)
 spring_length = scalar()
 spring_offset_a = vec()
 spring_offset_b = vec()
-spring_phase = scalar()
 spring_actuation = scalar()
 spring_stiffness = scalar()
 
@@ -76,6 +73,8 @@ weights2 = scalar()
 bias2 = scalar()
 actuation = scalar()
 
+dt = 0.001
+learning_rate = 1.0
 
 def n_input_states():
     return n_sin_waves + 6 * n_objects + 2
@@ -91,8 +90,8 @@ def allocate_fields():
                                          inverse_inertia)
     ti.root.dense(ti.i, n_springs).place(spring_anchor_a, spring_anchor_b,
                                          spring_length, spring_offset_a,
-                                         spring_offset_b, spring_stiffness,
-                                         spring_phase, spring_actuation)
+                                         spring_offset_b, spring_stiffness, 
+                                         spring_actuation)
     ti.root.dense(ti.ij, (n_hidden, n_input_states())).place(weights1)
     ti.root.dense(ti.ij, (n_springs, n_hidden)).place(weights2)
     ti.root.dense(ti.i, n_hidden).place(bias1)
@@ -101,11 +100,6 @@ def allocate_fields():
     ti.root.dense(ti.ij, (max_steps, n_hidden)).place(hidden)
     ti.root.place(loss, goal)
     ti.root.lazy_grad()
-
-
-dt = 0.001
-learning_rate = 1.0
-
 
 @ti.kernel
 def nn1(t: ti.i32):
@@ -247,6 +241,7 @@ def collide(t: ti.i32):
 
 @ti.kernel
 def apply_spring_force(t: ti.i32):
+    
     for i in range(n_springs):
         a = spring_anchor_a[i]
         b = spring_anchor_b[i]
@@ -254,7 +249,7 @@ def apply_spring_force(t: ti.i32):
         pos_b, vel_b, rela_b = to_world(t, b, spring_offset_b[i])
         dist = pos_a - pos_b
         length = dist.norm() + 1e-4
-
+        
         act = actuation[t, i]
 
         is_joint = spring_length[i] == -1
@@ -303,10 +298,97 @@ def advance_no_toi(t: ti.i32):
         omega[t, i] = s * omega[t - 1, i] + omega_inc[t, i]
         rotation[t, i] = rotation[t - 1, i] + dt * omega[t, i]
 
+amplitude = 0.75
+frequency = 0.425
+start_pos = ti.Vector([0.25, 0.5]) 
+goal_pos = ti.Vector([0.9, 0.5]) 
+deformation_loss_field = ti.field(dtype=real, shape=())
+# start_pos = ti.Vector([0.25, 0.25]) 
+# goal_pos = ti.Vector([0.9, 0.25]) 
+
+# Follow a cosine wave. Robot center node at trough of wave -> ground is lowest point on path.
+@ti.func
+def gen_cos_path(t, total_steps):
+    t_norm = t / total_steps
+    x = start_pos[0] + (goal_pos[0] - start_pos[0]) * t_norm
+    y = start_pos[1] - amplitude * ti.cos(frequency * 2 * math.pi * t_norm) 
+    return ti.Vector([x, y])
+
+@ti.func
+def gen_abs_sine_path(t, total_steps):
+    t_norm = t / total_steps
+    x = start_pos[0] + (goal_pos[0] - start_pos[0]) * t_norm
+    y = abs(start_pos[1] + amplitude * ti.sin(frequency * 2 * math.pi * t_norm))
+    return ti.Vector([x, y])
+
+@ti.func
+def gen_sine_path(t, total_steps):
+    t_norm = t / total_steps
+    x = start_pos[0] + (goal_pos[0] - start_pos[0]) * t_norm
+    y = start_pos[1] + 0.775 * ti.sin(frequency * 2 * math.pi * t_norm)
+    return ti.Vector([x, y])
+
+@ti.func
+def gen_parabola_path(t, total_steps):
+    t_norm = t / total_steps
+    x = start_pos[0] + (goal_pos[0] - start_pos[0]) * t_norm
+
+    # Parabola parameters
+    h = (start_pos[0] + goal_pos[0]) / 2  # Midpoint of x-range
+    k = start_pos[1] + 0.5  # Peak height
+    a = -0.5  # Controls curvature (negative for downward-facing)
+
+    y = a * (x - h) ** 2 + k  
+
+    return ti.Vector([x, y])
 
 @ti.kernel
-def compute_loss(t: ti.i32):
-    loss[None] = (x[t, head_id] - goal[None]).norm()
+def compute_deformation_loss(t: ti.i32):
+    loss_val = 0.0
+    for i in range(n_springs):
+        a = spring_anchor_a[i]
+        b = spring_anchor_b[i]
+        pos_a = x[t, a] + rotation_matrix(rotation[t, a]) @ spring_offset_a[i]
+        pos_b = x[t, b] + rotation_matrix(rotation[t, b]) @ spring_offset_b[i]
+        current_length = (pos_a - pos_b).norm()
+        loss_val += (current_length - spring_length[i]) ** 2
+    if shape == "wheel":
+        deformation_loss_field[None] =((loss_val - (n_objects-1))*100)
+    else:
+        deformation_loss_field[None] =((loss_val - (n_objects-1))*1)
+
+
+# path = "cos" # Options cos, sin, parabola.
+
+# Loss function weights.
+
+# ** Adjust weights.
+@ti.kernel
+def compute_loss(t: ti.i32, total_steps: ti.i32):
+    dist_w = 10
+    dev_w = 30
+    def_w = 1
+    
+    distance_loss = (x[t, head_id] - goal[None]).norm() * dist_w # Move right.
+
+    desired_pos = gen_sine_path(t, total_steps)
+    # Follow a specified path.
+    if path == "cos":
+        desired_pos = gen_cos_path(t, total_steps)
+    if path == "sin":
+        desired_pos = gen_abs_sine_path(t, total_steps)
+    if path == "para":
+        desired_pos = gen_parabola_path(t, total_steps)
+
+    if shape == "circle":
+        dev_w = 1
+    deviation_loss = (x[t, head_id] - desired_pos).norm() * dev_w # ** Adjust as needed.
+
+    deformation = deformation_loss_field[None] * def_w
+
+    print(f'Distance Loss: {distance_loss}, Deviation Loss: {deviation_loss}, Deformation Loss: {deformation}')
+    
+    loss[None] = distance_loss + deviation_loss + deformation
 
 
 gui = ti.GUI('Rigid Body Simulation', (512, 512), background_color=0xFFFFFF)
@@ -324,7 +406,8 @@ def forward(output=None, visualize=True):
         os.makedirs('rigid_body/{}/'.format(output), exist_ok=True)
         total_steps *= 2
 
-    goal[None] = [0.9, 0.15]
+    goal[None] = [0.9, 0.5]
+
     for t in range(1, total_steps):
         nn1(t - 1)
         nn2(t - 1)
@@ -397,7 +480,7 @@ def forward(output=None, visualize=True):
             gui.show(file=file)
 
     loss[None] = 0
-    compute_loss(steps - 1)
+    compute_loss(steps - 1, total_steps)
 
 
 @ti.kernel
@@ -442,7 +525,7 @@ def setup_robot(objects, springs, h_id):
 def optimize(toi=True, visualize=True):
     global use_toi
     use_toi = toi
-
+    
     for i in range(n_hidden):
         for j in range(n_input_states()):
             weights1[i, j] = np.random.randn() * math.sqrt(
@@ -453,20 +536,31 @@ def optimize(toi=True, visualize=True):
             # TODO: n_springs should be n_actuators
             weights2[i, j] = np.random.randn() * math.sqrt(
                 2 / (n_hidden + n_springs)) * 1
+            
+    for i in range(n_springs):
+        spring_stiffness[i] = np.random.randn() * 25 + 85
+
     '''
-  if visualize:
+    if visualize:
     clear_states()
     forward('initial{}'.format(robot_id))
-  '''
+    '''
 
     losses = []
-    for iter in range(20):
+
+    for iter in range(iters):
+        print(f"Iteration {iter}/{iters}")  # Inside the loop
+
         clear_states()
+        if iter != 0:
+            compute_deformation_loss(steps - 1)
+        else:
+            deformation_loss_field[None] = 0
 
         with ti.ad.Tape(loss):
             forward(visualize=visualize)
 
-        print('Iter=', iter, 'Loss=', loss[None])
+        print('Iter=', iter, 'Loss=', loss[None]) # **
 
         total_norm_sqr = 0
         for i in range(n_hidden):
@@ -478,6 +572,9 @@ def optimize(toi=True, visualize=True):
             for j in range(n_hidden):
                 total_norm_sqr += weights2.grad[i, j]**2
             total_norm_sqr += bias2.grad[i]**2
+        
+        for i in range(n_springs):
+            total_norm_sqr += spring_stiffness.grad[i]**2 
 
         print(total_norm_sqr)
 
@@ -493,25 +590,62 @@ def optimize(toi=True, visualize=True):
             for j in range(n_hidden):
                 weights2[i, j] -= scale * weights2.grad[i, j]
             bias2[i] -= scale * bias2.grad[i]
-
+        
+        for i in range(n_springs):
+            spring_stiffness[i] -= scale * spring_stiffness.grad[i] 
+        
         losses.append(loss[None])
+
     return losses
 
+import matplotlib.pyplot as plt
+
+def plot_single(losses, num_boxes):
+    plt.plot(losses, label=f'num_boxes {num_boxes} {iters} iterations') 
+    plt.xlabel('Iteration')
+    plt.ylabel('Loss')
+    plt.title('Loss over time for 100 iterations')
+    plt.grid(True)
+    plt.show()
+    plt.figtext(0.0, 0.0, f'Losses for {num_boxes} {shape} over {iters} iterations')
+
+import pickle
+import os
 
 robot_id = 0
-if len(sys.argv) != 3:
-    print(
-        "Usage: python3 rigid_body.py [robot_id=0, 1, 2, ...] [cmd=train/plot]"
-    )
-    exit(-1)
-else:
-    robot_id = int(sys.argv[1])
-    cmd = sys.argv[2]
-print(robot_id, cmd)
 
+
+def save_results(robot_id, losses, directory='results', filename=f'{robot_id}_results.pkl'):
+    # Ensure the directory exists
+    os.makedirs(directory, exist_ok=True)
+    
+    # Construct the full file path
+    filepath = os.path.join(directory, filename)
+    
+    # Save the results to the file
+    with open(filepath, 'wb') as f:
+        pickle.dump({'robot_id': robot_id, 'losses': losses}, f)
+    print(f"Results saved to {filepath}")
+
+def load_results(directory='results', filename=f'{robot_id}_results.pkl'):
+    # Construct the full file path
+    filepath = os.path.join(directory, filename)
+    
+    # Load the results from the file
+    with open(filepath, 'rb') as f:
+        data = pickle.load(f)
+    
+    robot_id = data['robot_id']
+    losses = data['losses']
+    
+    return robot_id, losses
+
+from robot_config import build_robot_skeleton
 
 def main():
-    setup_robot(*robots[robot_id]())
+    
+    a, b, c = build_robot_skeleton(num_boxes=robot_id, shape=shape)
+    setup_robot(a, b, c)
 
     if cmd == 'plot':
         ret = {}
@@ -521,16 +655,40 @@ def main():
                 losses = optimize(toi=toi, visualize=False)
                 # losses = gaussian_filter(losses, sigma=3)
                 ret[toi].append(losses)
+        clear_states()
+        #forward('final{}'.format(robot_id))
+        print(robot_id, losses)
 
         import pickle
         pickle.dump(ret, open('losses.pkl', 'wb'))
         print("Losses saved to losses.pkl")
-    else:
-        optimize(toi=True, visualize=True)
-
-    clear_states()
-    forward('final{}'.format(robot_id))
-
+    if cmd == 'single':
+        losses = optimize(toi=True, visualize=True)
+        plot_single(losses, robot_id)
+        clear_states()
+        forward('final{}'.format(robot_id))
+    elif cmd == 'para':
+        losses = optimize(toi=True, visualize=False)
+        save_results(robot_id, losses, directory='results', filename=filename)
+        clear_states()
+    else: 
+        losses = optimize(toi=True, visualize=True)
+        clear_states()
+        forward('final{}'.format(robot_id))
 
 if __name__ == '__main__':
-    main()
+    import sys
+    if len(sys.argv) != 7: 
+        print(
+        "Usage: python3 rigid_body.py [num_boxes=0, 1, 2, ...] [cmd=single/para] [shape=wheel/circle] [iter=10, 20, ..., 100] [path=cos/sin/parabola] [filename=""]"
+        )   
+        exit(-1)
+    else:
+        robot_id = int(sys.argv[1])
+        cmd = sys.argv[2]
+        shape = sys.argv[3]
+        iters = int(sys.argv[4])
+        path = sys.argv[5]
+        filename = sys.argv[6]
+        print(sys.argv)
+        main()
